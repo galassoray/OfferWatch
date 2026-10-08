@@ -1,0 +1,6 @@
+# This repository is public. Never commit real captures, client allowlists or reports.
+captures/
+allowlist.json
+*.local.json
+__pycache__/
+prototype/comparison_demo.json

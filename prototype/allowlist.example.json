@@ -1,0 +1,20 @@
+{
+  "tenant_id": "demo-agency",
+  "market": "Fictional Metro (synthetic)",
+  "synthetic": true,
+  "user_agent": "OfferWatchBot/0.1 (+mailto:OWNER_CONTACT)",
+  "pages": [
+    {
+      "id": "Fictional North HVAC",
+      "url": "https://example.com/north",
+      "approved_by": "SYNTHETIC — replace with the agency contact who approved this page",
+      "approved_at": "2026-10-01T16:00:00Z",
+      "access_rules_checked_by": "",
+      "access_rules_checked_at": "",
+      "access_rules_note": "Fill in after reading the site's terms and confirming the page is public (no login, no CAPTCHA).",
+      "fields": {
+        "advertised_offer": {"pattern": "(\\$\\d{1,4}\\s*(?:off\\s*)?tune[- ]?up)"}
+      }
+    }
+  ]
+}

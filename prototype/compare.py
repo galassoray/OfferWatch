@@ -33,6 +33,9 @@ def validate(snapshot):
             raise ValueError('Facts must map strings to strings')
         if page['status'] == 'ok' and (page.get('reviewed') is not True or not page.get('evidence_note')):
             raise ValueError('Successful snapshots require review and evidence note')
+        if page['status'] == 'ok' and page.get('capture_method') == 'automated' and not (
+                page.get('review_method') == 'interactive_cli' and page.get('reviewed_by') and page.get('reviewed_at')):
+            raise ValueError('Automated captures need an attributed human review')
         pages[key] = page
     return pages
 
