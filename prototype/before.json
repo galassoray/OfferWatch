@@ -1,0 +1,39 @@
+{
+  "as_of": "2026-10-01T16:00:00Z",
+  "synthetic": true,
+  "pages": [
+    {
+      "id": "Fictional North HVAC",
+      "url": "https://example.com/north",
+      "observed_at": "2026-10-01T16:00:00Z",
+      "status": "ok",
+      "facts": {
+        "advertised_offer": "$99 tune-up"
+      },
+      "reviewed": true,
+      "evidence_note": "Fictional fixture only; no real business represented."
+    },
+    {
+      "id": "Fictional East Heating",
+      "url": "https://example.com/east",
+      "observed_at": "2026-10-01T16:00:00Z",
+      "status": "ok",
+      "facts": {
+        "advertised_offer": "0% subject to approval"
+      },
+      "reviewed": true,
+      "evidence_note": "Fictional fixture only; no real business represented."
+    },
+    {
+      "id": "Fictional South Air",
+      "url": "https://example.com/south",
+      "observed_at": "2026-10-01T16:00:00Z",
+      "status": "ok",
+      "facts": {
+        "advertised_offer": "$100 repair credit"
+      },
+      "reviewed": true,
+      "evidence_note": "Fictional fixture only; no real business represented."
+    }
+  ]
+}
