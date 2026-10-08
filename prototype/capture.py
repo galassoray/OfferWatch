@@ -1,68 +1,51 @@
-"""OfferWatch capture/import adapter. Python stdlib only.
+"""OfferWatch capture adapter. Python stdlib only.
 
-Produces page records for compare.py from (a) a guarded single-page HTTPS fetch of an
-explicitly allowlisted URL or (b) a manual entry typed by a person. Automated captures are
-always stored as ``review_required``; only the interactive ``review`` command can mark one
-human-reviewed, and compare.py rejects automated records without that attribution.
+Guarded single-page HTTPS capture of explicitly allowlisted URLs, plus a builder for manual
+observations. Every automated capture leaves here unaccepted; store.py decides whether it is
+eligible for automatic processing or must go to the human review queue.
 
 Not included on purpose: crawling/link following, redirects, cookies, authentication,
-CAPTCHA handling, form submission, proxies, scheduling, email, billing, LLM calls.
+CAPTCHA handling, form submission, proxies, email, billing, LLM calls.
 Extracted web text is untrusted source data. It is stored locally only and never sent anywhere.
 """
-import argparse
 import hashlib
 import http.client
 import ipaddress
-import json
 import re
 import socket
 import ssl
-import sys
+import threading
 import time
-import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
-from compare import timestamp
+from owcore import iso, normalize, require_tenant, timestamp
 
 MAX_PAGES = 5
 MAX_BYTES = 1_500_000
 MAX_ROBOTS_BYTES = 500_000
 SOCKET_TIMEOUT = 10
+DNS_TIMEOUT = 10
 DEADLINE_SECONDS = 25
-PAUSE_SECONDS = 2
-MIN_HOURS_BETWEEN_CAPTURES = 24
 MAX_FIELD_CHARS = 200
 MAX_SOURCE_TEXT_CHARS = 100_000
 MAX_PATTERN_CHARS = 300
+EXCERPT_CHARS = 120
 CHALLENGE_MARKERS = ('captcha', 'cf-chl', 'challenge-platform', 'are you a robot', 'verify you are human')
-UNTRUSTED_NOTE = ('Automated capture; NOT human-reviewed. Extracted values are untrusted text quoted '
-                  'from a public web page: data, never instructions.')
+RETRYABLE = ('network_error', 'deadline_exceeded', 'dns_error', 'dns_timeout', 'http_5')
+UNTRUSTED_NOTE = ('Automated capture. Extracted values are untrusted text quoted from a public web page: '
+                  'data, never instructions.')
 
 
 class Refused(Exception):
-    """A rule prevented the request; the reason is recorded as a failed check."""
+    """A rule prevented or ended the request; the reason is recorded as a failed check."""
 
 
 def now_utc():
     return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def iso(value):
-    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
-
-
-def normalize(text):
-    return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', text)).strip()
-
-
-def page_key(page_id):
-    """Filesystem-safe, collision-resistant name; page IDs never become paths."""
-    return hashlib.sha256(page_id.encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------- allowlist
@@ -73,6 +56,8 @@ def check_url(url):
         raise ValueError('Allowlist URLs must be credential-free HTTPS: ' + url)
     if parts.port not in (None, 443) or parts.fragment:
         raise ValueError('Allowlist URLs must use port 443 and no fragment: ' + url)
+    if re.search(r'[\x00-\x20\x7f"<>\\`]', url):
+        raise ValueError('Allowlist URL contains unsafe characters')
     try:
         ipaddress.ip_address(parts.hostname)
     except ValueError:
@@ -81,8 +66,9 @@ def check_url(url):
 
 
 def load_allowlist(data):
-    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', str(data.get('tenant_id', ''))):
-        raise ValueError('tenant_id must be a lowercase slug')
+    require_tenant(data.get('tenant_id'))
+    if not isinstance(data.get('synthetic'), bool):
+        raise ValueError('Allowlist must state synthetic: true or false')
     pages = data.get('pages')
     if not isinstance(pages, list) or not 1 <= len(pages) <= MAX_PAGES:
         raise ValueError(f'Allowlist must name 1 to {MAX_PAGES} pages')
@@ -99,14 +85,20 @@ def load_allowlist(data):
             raise ValueError('Page not explicitly approved: ' + entry['id'])
         timestamp(entry.get('approved_at', ''))
         fields = entry.get('fields', {})
-        if not isinstance(fields, dict):
-            raise ValueError('fields must be an object')
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError('Each page needs at least one field rule: ' + entry['id'])
         for name, rule in fields.items():
             pattern = rule.get('pattern', '') if isinstance(rule, dict) else ''
             if not pattern or len(pattern) > MAX_PATTERN_CHARS:
                 raise ValueError(f'Field {name} needs a pattern of at most {MAX_PATTERN_CHARS} chars')
+            if rule.get('case', 'sensitive') not in ('sensitive', 'insensitive'):
+                raise ValueError(f'Field {name}: case must be "sensitive" or "insensitive"')
             re.compile(pattern)
     return data
+
+
+def field_rules(entry):
+    return {name: {'case': rule.get('case', 'sensitive')} for name, rule in entry.get('fields', {}).items()}
 
 
 def entry_for(allowlist, page_id):
@@ -129,10 +121,32 @@ def access_attested(entry):
 
 # ---------------------------------------------------------------- transport
 
-def resolve_public(host, getaddrinfo=socket.getaddrinfo):
+def _bounded_getaddrinfo(host, port):
+    """getaddrinfo cannot be cancelled; wait at most DNS_TIMEOUT for a daemon resolver thread."""
+    box = {}
+
+    def work():
+        try:
+            box['infos'] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            box['error'] = exc
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(DNS_TIMEOUT)
+    if thread.is_alive():
+        raise socket.timeout('dns_timeout')
+    if 'error' in box:
+        raise box['error']
+    return box['infos']
+
+
+def resolve_public(host, getaddrinfo=None):
     """Return one vetted address; refuse if ANY resolved address is not public."""
     try:
-        infos = getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        infos = getaddrinfo(host, 443, type=socket.SOCK_STREAM) if getaddrinfo else _bounded_getaddrinfo(host, 443)
+    except socket.timeout as exc:
+        raise Refused('dns_timeout') from exc
     except OSError as exc:
         raise Refused('dns_error') from exc
     addresses = sorted({info[4][0] for info in infos})
@@ -157,18 +171,42 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
         sock = socket.create_connection((self._address, 443), self.timeout)
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
+    def abort(self):
+        """Called by the watchdog from another thread: unblocks any pending socket call."""
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
 
 def https_get(url, user_agent, max_bytes=MAX_BYTES, resolve=resolve_public,
-              connection_factory=PinnedHTTPSConnection, clock=time.monotonic):
+              connection_factory=PinnedHTTPSConnection, clock=time.monotonic, deadline=DEADLINE_SECONDS):
     """One GET, no redirects, no cookies, identity encoding, bounded size and time.
 
-    Connects directly (environment proxies are ignored so the address check is meaningful).
+    Time bounds: DNS waits at most DNS_TIMEOUT; each socket operation at most SOCKET_TIMEOUT;
+    a watchdog aborts the connection at `deadline`, and the read loop re-checks the deadline
+    between single-recv reads. Connects directly (proxies ignored so the address check is meaningful).
     """
     parts = urlsplit(url)
     started = clock()
     address = resolve(parts.hostname)
+    remaining = deadline - (clock() - started)
+    if remaining <= 0:
+        raise Refused('deadline_exceeded')
     path = (parts.path or '/') + ('?' + parts.query if parts.query else '')
-    conn = connection_factory(parts.hostname, address, SOCKET_TIMEOUT)
+    conn = connection_factory(parts.hostname, address, min(SOCKET_TIMEOUT, remaining))
+    expired = threading.Event()
+
+    def fire():
+        expired.set()
+        if hasattr(conn, 'abort'):
+            conn.abort()
+
+    watchdog = threading.Timer(remaining, fire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         conn.request('GET', path, headers={'User-Agent': user_agent, 'Accept': 'text/html,text/plain',
                                            'Accept-Encoding': 'identity', 'Connection': 'close'})
@@ -178,21 +216,28 @@ def https_get(url, user_agent, max_bytes=MAX_BYTES, resolve=resolve_public,
         if declared.isdigit() and int(declared) > max_bytes:
             raise Refused('response_too_large')
         chunks, total = [], 0
+        reader = response.read1 if hasattr(response, 'read1') else response.read
         while True:
-            if clock() - started > DEADLINE_SECONDS:
+            if expired.is_set() or clock() - started > deadline:
                 raise Refused('deadline_exceeded')
-            chunk = response.read(65536)
+            chunk = reader(65536)
             if not chunk:
                 break
             total += len(chunk)
             if total > max_bytes:
                 raise Refused('response_too_large')
             chunks.append(chunk)
+        if expired.is_set():
+            raise Refused('deadline_exceeded')
         return {'status': response.status, 'headers': headers, 'body': b''.join(chunks)}
-    except (OSError, http.client.HTTPException) as exc:
-        raise Refused('network_error:' + type(exc).__name__) from exc
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise Refused('deadline_exceeded' if expired.is_set() else 'network_error:' + type(exc).__name__) from exc
     finally:
+        watchdog.cancel()
         conn.close()
+
+
+https_get.real_network = True
 
 
 # ---------------------------------------------------------------- robots.txt
@@ -240,22 +285,40 @@ class VisibleText(HTMLParser):
 
 
 def visible_text(markup):
+    """Text nodes joined by single spaces. Only ASCII layout whitespace is collapsed, so raw
+    values keep non-breaking spaces and other characters exactly as served."""
     parser = VisibleText()
     parser.feed(markup)
     parser.close()
-    return normalize(' '.join(parser.parts))[:MAX_SOURCE_TEXT_CHARS]
+    return re.sub(r'[ \t\r\n\f\v]+', ' ', ' '.join(parser.parts)).strip()[:MAX_SOURCE_TEXT_CHARS]
 
 
 def extract(text, fields):
-    facts, missing = {}, []
+    """Return raw values, display values, missing fields, anomalies and quoted evidence."""
+    raw, facts, missing, anomalies, evidence = {}, {}, [], [], {}
     for name, rule in sorted(fields.items()):
-        match = re.search(rule['pattern'], text, re.IGNORECASE)
-        value = normalize(match.group(match.re.groups and 1 or 0)) if match else ''
-        if value:
-            facts[name] = value[:MAX_FIELD_CHARS]
-        else:
+        pattern = re.compile(rule['pattern'], re.IGNORECASE)
+        matches = []
+        for match in pattern.finditer(text):
+            value = match.group(1 if pattern.groups else 0) or ''
+            if normalize(value):
+                matches.append((value, match.start(), match.end()))
+            if len(matches) >= 5:
+                break
+        if not matches:
             missing.append(name)
-    return facts, missing
+            continue
+        value, start, end = matches[0]
+        distinct = sorted({normalize(m[0]) for m in matches})
+        if len(distinct) > 1:
+            anomalies.append(f'ambiguous_match:{name}')
+        if len(value) > MAX_FIELD_CHARS:
+            anomalies.append(f'truncated:{name}')
+        raw[name] = value[:MAX_FIELD_CHARS]
+        facts[name] = normalize(value)[:MAX_FIELD_CHARS]
+        evidence[name] = {'excerpt': text[max(0, start - EXCERPT_CHARS):end + EXCERPT_CHARS],
+                          'candidates': distinct[:5]}
+    return raw, facts, missing, anomalies, evidence
 
 
 def header_time(value):
@@ -269,8 +332,9 @@ def header_time(value):
 
 def base_record(allowlist, entry, observed_at, status, method):
     return {'tenant_id': allowlist['tenant_id'], 'id': entry['id'], 'url': entry['url'],
-            'observed_at': iso(observed_at), 'status': status, 'facts': {}, 'capture_method': method,
-            'reviewed': False, 'review_status': 'review_required'}
+            'observed_at': iso(observed_at), 'status': status, 'raw_facts': {}, 'facts': {},
+            'missing_fields': [], 'anomalies': [], 'evidence': {}, 'source_times': {},
+            'capture_method': method, 'evidence_note': ''}
 
 
 def failed(allowlist, entry, observed_at, reason, **extra):
@@ -280,10 +344,14 @@ def failed(allowlist, entry, observed_at, reason, **extra):
     return record
 
 
+def retryable(record):
+    return record['status'] == 'failed' and record.get('failure_reason', '').startswith(RETRYABLE)
+
+
 def capture_page(allowlist, entry, transport=https_get, robots_cache=None, clock=now_utc):
-    """Return a review-required record. Never raises for remote behaviour; failures are records."""
-    if allowlist.get('synthetic'):
-        raise ValueError('Synthetic allowlists are for offline tests only; refusing network access')
+    """Return an unaccepted record. Never raises for remote behaviour; failures are records."""
+    if allowlist.get('synthetic') and getattr(transport, 'real_network', False):
+        raise ValueError('Synthetic allowlists are for offline use only; refusing network access')
     user_agent = allowlist.get('user_agent', '')
     if not re.fullmatch(r'[A-Za-z]+Bot/[\w.]+ \(\+\S+\)', user_agent) or 'OWNER_CONTACT' in user_agent:
         raise ValueError('Set user_agent to "NameBot/version (+contact)" with a real contact')
@@ -321,203 +389,31 @@ def capture_page(allowlist, entry, transport=https_get, robots_cache=None, clock
     text = visible_text(markup)
     if any(marker in text.lower() for marker in CHALLENGE_MARKERS):
         return failed(allowlist, entry, received_at, 'possible_access_challenge', source_times=times)
-    facts, missing = extract(text, entry.get('fields', {}))
+    raw, facts, missing, anomalies, evidence = extract(text, entry['fields'])
     record = base_record(allowlist, entry, received_at, 'ok', 'automated')
-    record.update(facts=facts, missing_fields=missing, source_times=times, evidence_note=UNTRUSTED_NOTE,
-                  content_sha256=hashlib.sha256(response['body']).hexdigest(), bytes=len(response['body']),
-                  untrusted_source_text=text)
+    record.update(raw_facts=raw, facts=facts, missing_fields=missing, anomalies=anomalies, evidence=evidence,
+                  source_times=times, evidence_note=UNTRUSTED_NOTE, text_length=len(text),
+                  content_sha256=hashlib.sha256(response['body']).hexdigest(), untrusted_source_text=text)
     return record
 
 
-def manual_record(allowlist, page_id, observed_at, facts, reviewer, evidence_note, failure_reason=None):
-    """Fallback: a person looked at the page and typed what it said."""
-    if not reviewer:
-        raise ValueError('Manual entries need the name of the person who looked at the page')
+def manual_record(allowlist, page_id, observed_at, facts, failure_reason=None, evidence_note=''):
+    """A person looked at the page and typed what it said (the review is recorded by store.py)."""
     entry = entry_for(allowlist, page_id)
     observed = timestamp(observed_at)
     if observed > now_utc() + timedelta(minutes=5):
         raise ValueError('observed_at is in the future')
+    if any(not normalize(v) for v in facts.values()):
+        raise ValueError('Empty values are not allowed; leave the field out instead')
+    unknown = set(facts) - set(entry['fields'])
+    if unknown:
+        raise ValueError('Unknown fields: ' + ', '.join(sorted(unknown)))
     record = base_record(allowlist, entry, observed, 'failed' if failure_reason else 'ok', 'manual')
-    record.update(facts={} if failure_reason else {k: normalize(v)[:MAX_FIELD_CHARS] for k, v in facts.items()},
-                  reviewed=True, review_status='human_reviewed', reviewed_by=reviewer,
-                  reviewed_at=iso(now_utc()), review_method='manual_entry',
-                  evidence_note=evidence_note or 'Manual observation entered by ' + reviewer)
     if failure_reason:
-        record['failure_reason'] = failure_reason
+        record.update(failure_reason=failure_reason,
+                      evidence_note=evidence_note or 'Manual check could not verify the page.')
+    else:
+        record.update(raw_facts=dict(facts), facts={k: normalize(v)[:MAX_FIELD_CHARS] for k, v in facts.items()},
+                      missing_fields=sorted(set(entry['fields']) - set(facts)),
+                      evidence_note=evidence_note or 'Manual observation.')
     return record
-
-
-def apply_human_review(record, reviewer, corrections=None, failure_reason=None, reviewed_at=None):
-    """Called only from the interactive review command after a person confirms."""
-    if not reviewer:
-        raise ValueError('Reviewer name required')
-    result = dict(record)
-    result['facts'] = dict(record['facts'])
-    for field, value in (corrections or {}).items():
-        result['facts'][field] = normalize(value)[:MAX_FIELD_CHARS]
-    if failure_reason:
-        result.update(status='failed', facts={}, failure_reason=failure_reason)
-    result.update(reviewed=True, review_status='human_reviewed', reviewed_by=reviewer,
-                  reviewed_at=iso(reviewed_at or now_utc()), review_method='interactive_cli',
-                  corrections=sorted(corrections or {}),
-                  evidence_note=f'Automated capture reviewed by {reviewer}'
-                                + (' with corrections' if corrections else '') + '.')
-    result.pop('untrusted_source_text', None)
-    return result
-
-
-# ---------------------------------------------------------------- storage
-
-def tenant_dir(root, tenant_id):
-    return Path(root) / tenant_id
-
-
-def save(root, record):
-    folder = tenant_dir(root, record['tenant_id'])
-    folder.mkdir(parents=True, exist_ok=True)
-    stamp = record['observed_at'].replace('-', '').replace(':', '')
-    path = folder / f'{stamp}-{page_key(record["id"])}-{record["capture_method"]}.json'
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
-    return path
-
-
-def load_records(root, tenant_id):
-    records = []
-    for path in sorted(tenant_dir(root, tenant_id).glob('*.json')):
-        record = json.loads(path.read_text(encoding='utf-8'))
-        if record.get('tenant_id') == tenant_id:
-            records.append((path, record))
-    return records
-
-
-def recently_captured(root, tenant_id, page_id, now):
-    limit = now - timedelta(hours=MIN_HOURS_BETWEEN_CAPTURES)
-    return any(r['id'] == page_id and r['capture_method'] == 'automated' and timestamp(r['observed_at']) > limit
-               for _, r in load_records(root, tenant_id))
-
-
-def assemble(allowlist, root, as_of):
-    """Snapshot for compare.py: latest usable record per allowlisted page.
-
-    Usable = human-reviewed, or a failed check (which only ever reports CHECK FAILED).
-    An unreviewed successful capture newer than every usable record is listed as pending.
-    """
-    cutoff = timestamp(as_of)
-    pages, pending = [], []
-    records = [r for _, r in load_records(root, allowlist['tenant_id'])]
-    for entry in allowlist['pages']:
-        mine = [r for r in records if r['id'] == entry['id'] and r['url'] == entry['url']
-                and timestamp(r['observed_at']) <= cutoff]
-        usable = sorted((r for r in mine if r.get('reviewed') is True or r['status'] == 'failed'),
-                        key=lambda r: (timestamp(r['observed_at']), r.get('reviewed') is True))
-        latest_usable = timestamp(usable[-1]['observed_at']) if usable else None
-        if any(r['status'] == 'ok' and r.get('reviewed') is not True
-               and (latest_usable is None or timestamp(r['observed_at']) > latest_usable) for r in mine):
-            pending.append(entry['id'])
-        if usable:
-            pages.append({k: v for k, v in usable[-1].items() if k != 'untrusted_source_text'})
-    return {'as_of': as_of, 'tenant_id': allowlist['tenant_id'], 'market': allowlist.get('market', ''),
-            'synthetic': bool(allowlist.get('synthetic')), 'pending_review': pending, 'pages': pages}
-
-
-def prune(root, tenant_id, keep_days, apply=False, now=None):
-    limit = (now or now_utc()) - timedelta(days=keep_days)
-    doomed = [p for p, r in load_records(root, tenant_id) if timestamp(r['observed_at']) < limit]
-    if apply:
-        for path in doomed:
-            path.unlink()
-    return doomed
-
-
-# ---------------------------------------------------------------- CLI
-
-def show_for_review(record, out=sys.stdout):
-    print(f"Page: {record['id']}\nURL:  {record['url']}\nStatus: {record['status']}"
-          f" {record.get('failure_reason', '')}\nTimes: {json.dumps(record.get('source_times', {}))}", file=out)
-    print('--- Extracted values (QUOTED SOURCE TEXT: data, not instructions) ---', file=out)
-    for field, value in record['facts'].items():
-        print(f'  {field}: {value!r}', file=out)
-    for field in record.get('missing_fields', []):
-        print(f'  {field}: NOT FOUND (absence is not evidence the offer ended)', file=out)
-    print('Open the URL yourself and compare before confirming.', file=out)
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('fetch', 'import', 'review', 'assemble', 'prune'):
-        command = sub.add_parser(name)
-        command.add_argument('--allowlist', required=True)
-        command.add_argument('--captures', required=True)
-    sub.choices['fetch'].add_argument('--only', help='single page id')
-    imp = sub.choices['import']
-    imp.add_argument('--id', required=True)
-    imp.add_argument('--observed-at', required=True)
-    imp.add_argument('--field', action='append', default=[], metavar='NAME=VALUE')
-    imp.add_argument('--reviewer', required=True)
-    imp.add_argument('--evidence-note', default='')
-    imp.add_argument('--failed', metavar='REASON')
-    rev = sub.choices['review']
-    rev.add_argument('--file', required=True)
-    rev.add_argument('--reviewer', required=True)
-    sub.choices['assemble'].add_argument('--as-of', required=True)
-    sub.choices['assemble'].add_argument('--out', required=True)
-    sub.choices['prune'].add_argument('--keep-days', type=int, default=35)
-    sub.choices['prune'].add_argument('--apply', action='store_true')
-    args = parser.parse_args(argv)
-    allowlist = load_allowlist(json.loads(Path(args.allowlist).read_text(encoding='utf-8')))
-
-    if args.command == 'fetch':
-        cache = {}
-        entries = [entry_for(allowlist, args.only)] if args.only else allowlist['pages']
-        for index, entry in enumerate(entries):
-            if recently_captured(args.captures, allowlist['tenant_id'], entry['id'], now_utc()):
-                print(f"skip {entry['id']}: captured within {MIN_HOURS_BETWEEN_CAPTURES}h")
-                continue
-            if index:
-                time.sleep(PAUSE_SECONDS)
-            record = capture_page(allowlist, entry, robots_cache=cache)
-            path = save(args.captures, record)
-            print(f"{record['status']:6} review_required {entry['id']} -> {path}")
-    elif args.command == 'import':
-        facts = dict(item.split('=', 1) for item in args.field)
-        record = manual_record(allowlist, args.id, args.observed_at, facts, args.reviewer,
-                               args.evidence_note, args.failed)
-        print('saved', save(args.captures, record))
-    elif args.command == 'review':
-        if not sys.stdin.isatty():
-            sys.exit('Review must be done by a person at an interactive terminal.')
-        path = Path(args.file).resolve()
-        if tenant_dir(args.captures, allowlist['tenant_id']).resolve() not in path.parents:
-            sys.exit("File is outside this tenant's capture folder.")
-        record = json.loads(path.read_text(encoding='utf-8'))
-        if record.get('reviewed') or record.get('tenant_id') != allowlist['tenant_id']:
-            sys.exit('Already reviewed or belongs to another tenant.')
-        entry_for(allowlist, record['id'])
-        show_for_review(record)
-        corrections = {}
-        for field in sorted(set(record['facts']) | set(record.get('missing_fields', []))):
-            typed = input(f'{field}: Enter keeps the value, or type the correct value: ').strip()
-            if typed:
-                corrections[field] = typed
-        reason = input('If the page could not be verified, type a failure reason (else Enter): ').strip()
-        if input(f"Type the page id ({record['id']}) to confirm you checked the live page: ") != record['id']:
-            sys.exit('Not confirmed; record left as review_required.')
-        reviewed = apply_human_review(record, args.reviewer, corrections, reason or None)
-        path.with_name(path.stem + '-reviewed.json').write_text(
-            json.dumps(reviewed, indent=2, ensure_ascii=False), encoding='utf-8')
-        print('reviewed record saved')
-    elif args.command == 'assemble':
-        snapshot = assemble(allowlist, args.captures, args.as_of)
-        Path(args.out).write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding='utf-8')
-        print(f"{len(snapshot['pages'])} reviewed pages; pending review: {snapshot['pending_review']}")
-    elif args.command == 'prune':
-        doomed = prune(args.captures, allowlist['tenant_id'], args.keep_days, args.apply)
-        print(('deleted' if args.apply else 'would delete (dry run; add --apply)'), len(doomed), 'files')
-
-
-if __name__ == '__main__':
-    try:
-        main()
-    except ValueError as exc:
-        sys.exit('refused: ' + str(exc))

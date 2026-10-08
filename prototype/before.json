@@ -1,4 +1,5 @@
 {
+  "tenant_id": "demo-agency",
   "as_of": "2026-10-01T16:00:00Z",
   "synthetic": true,
   "pages": [
@@ -11,7 +12,8 @@
         "advertised_offer": "$99 tune-up"
       },
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     },
     {
       "id": "Fictional East Heating",
@@ -22,7 +24,8 @@
         "advertised_offer": "0% subject to approval"
       },
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     },
     {
       "id": "Fictional South Air",
@@ -33,7 +36,8 @@
         "advertised_offer": "$100 repair credit"
       },
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     }
   ]
 }

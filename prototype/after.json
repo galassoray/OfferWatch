@@ -1,6 +1,13 @@
 {
+  "tenant_id": "demo-agency",
   "as_of": "2026-10-06T16:00:00Z",
   "synthetic": true,
+  "expected_pages": [
+    "Fictional North HVAC",
+    "Fictional East Heating",
+    "Fictional South Air",
+    "Fictional West Comfort"
+  ],
   "pages": [
     {
       "id": "Fictional North HVAC",
@@ -11,7 +18,8 @@
         "advertised_offer": "$79 tune-up"
       },
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     },
     {
       "id": "Fictional East Heating",
@@ -22,7 +30,8 @@
         "advertised_offer": "0% subject to approval"
       },
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     },
     {
       "id": "Fictional South Air",
@@ -31,7 +40,8 @@
       "status": "failed",
       "facts": {},
       "reviewed": true,
-      "evidence_note": "Fictional fixture only; no real business represented."
+      "evidence_note": "Fictional fixture only; no real business represented.",
+      "tenant_id": "demo-agency"
     },
     {
       "id": "Fictional West Comfort",
@@ -42,7 +52,8 @@
         "advertised_offer": "New customer discount; amount unspecified"
       },
       "reviewed": true,
-      "evidence_note": "First synthetic observation; no prior comparison."
+      "evidence_note": "First synthetic observation; no prior comparison.",
+      "tenant_id": "demo-agency"
     }
   ]
 }

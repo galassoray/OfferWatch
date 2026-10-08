@@ -1,6 +1,14 @@
-# This repository is public. Never commit real captures, client allowlists or reports.
+# This repository is public. Never commit real captures, client allowlists, ledgers, reports or logs.
+# Operational data belongs in %LOCALAPPDATA%\OfferWatch (the code refuses data folders inside a git tree).
 captures/
 allowlist.json
 *.local.json
+*.sqlite3
+*.sqlite3-journal
+run.lock*
+STATUS.txt
+status.json
+logs/
+rehearsal-output/
 __pycache__/
 prototype/comparison_demo.json
